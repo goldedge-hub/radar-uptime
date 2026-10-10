@@ -599,10 +599,17 @@ def _post_resend(data: bytes, api_key: str) -> int:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            # Resend sits behind Cloudflare, which rejects the default
+            # "Python-urllib" User-Agent with 403 (error code 1010).
+            "User-Agent": "radar-uptime-monitor/1.0",
         },
     )
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
-        response.read(100_000)
+        payload = response.read(100_000)
+        try:
+            log.info("Resend przyjął e-mail, id=%s.", json.loads(payload or b"{}").get("id"))
+        except ValueError:
+            pass
         return int(getattr(response, "status", 0) or 0)
 
 
