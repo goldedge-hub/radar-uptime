@@ -1,0 +1,67 @@
+name: uptime
+
+# Monitor dostępności Radar Nieruchomości.
+# Repozytorium: goldedge-hub/radar-uptime
+# Sekrety: RESEND_API_KEY, ALERT_TO, ALERT_FROM (opcjonalnie ALERT_TO_OVERRIDE).
+
+on:
+  schedule:
+    # Co 10 minut.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: 'Wymuś awarię jednego sprawdzenia (test ścieżki alertu)'
+        type: boolean
+        default: false
+      alert_to_override:
+        description: 'Zastępczy adres odbiorcy alertu (opcjonalnie)'
+        type: string
+        required: false
+
+permissions:
+  contents: write # zapis stanu na gałęzi `state`
+  actions: write # keepalive: ponowne włączenie workflow
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  uptime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Pełna historia, żeby gałąź stanu `state` dała się pobrać.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Sprawdź stronę
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_TO_OVERRIDE: ${{ github.event.inputs.alert_to_override || secrets.ALERT_TO_OVERRIDE }}
+          FORCE_FAIL: ${{ github.event.inputs.force_fail || 'false' }}
+        run: python3 check.py
+
+      # GitHub wyłącza zadania cron w nieaktywnych repozytoriach, dlatego raz w
+      # miesiącu (1. dzień, pierwsze uruchomienie po 00:00 UTC) włączamy workflow
+      # ponownie. Błąd jest ignorowany — to tylko zabezpieczenie.
+      - name: Keepalive (1. dzień miesiąca)
+        if: always() && github.event_name == 'schedule' && github.event.schedule == '*/10 * * * *'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%d)" = "01" ] && [ "$(date -u +%H)" = "00" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime.yml/enable" || true
+          fi
