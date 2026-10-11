@@ -6,8 +6,9 @@ name: uptime
 
 on:
   schedule:
-    # Co 10 minut.
-    - cron: '*/10 * * * *'
+    # Co 10 minut, z przesunięciem od pełnych minut (GitHub mocno opóźnia/pomija
+    # crony startujące o :00/:10/... w godzinach szczytu).
+    - cron: '7-59/10 * * * *'
   workflow_dispatch:
     inputs:
       force_fail:
@@ -57,7 +58,7 @@ jobs:
       # miesiącu (1. dzień, pierwsze uruchomienie po 00:00 UTC) włączamy workflow
       # ponownie. Błąd jest ignorowany — to tylko zabezpieczenie.
       - name: Keepalive (1. dzień miesiąca)
-        if: always() && github.event_name == 'schedule' && github.event.schedule == '*/10 * * * *'
+        if: always() && github.event_name == 'schedule' && github.event.schedule == '7-59/10 * * * *'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
