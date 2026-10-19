@@ -622,6 +622,7 @@ def send_mail(
     text: str,
     html_body: str | None,
     poster=None,
+    bcc: list[str] | None = None,
 ) -> bool:
     """Wyślij jedną wiadomość. Brak konfiguracji to log, nie wyjątek."""
     if not api_key:
@@ -633,6 +634,9 @@ def send_mail(
     payload = {"from": sender, "to": recipients, "subject": subject, "text": text}
     if html_body:
         payload["html"] = html_body
+    bcc = [addr for addr in (bcc or []) if addr.lower() not in {r.lower() for r in recipients}]
+    if bcc:
+        payload["bcc"] = bcc
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     post = poster or _post_resend
     try:
@@ -660,6 +664,9 @@ def deliver_mails(
     api_key = env.get("RESEND_API_KEY")
     sender = env.get("ALERT_FROM") or DEFAULT_ALERT_FROM
     recipients = parse_recipients(env.get("ALERT_TO_OVERRIDE") or env.get("ALERT_TO"))
+    # Kopia alertów (BCC, np. dla agenta ops). Przy ręcznym ALERT_TO_OVERRIDE
+    # (test) kopii nie dokładamy — mail idzie tylko pod wskazany adres.
+    bcc = [] if env.get("ALERT_TO_OVERRIDE") else parse_recipients(env.get("ALERT_BCC"))
     if action.get("notify"):
         subject, text, html_body = build_mail(action, results, now)
         send_mail(
@@ -670,6 +677,7 @@ def deliver_mails(
             text=text,
             html_body=html_body,
             poster=poster,
+            bcc=bcc,
         )
     if action.get("ssl_warning"):
         subject, text, html_body = build_mail(action, results, now, ssl_only=True)
@@ -681,6 +689,7 @@ def deliver_mails(
             text=text,
             html_body=html_body,
             poster=poster,
+            bcc=bcc,
         )
 
 

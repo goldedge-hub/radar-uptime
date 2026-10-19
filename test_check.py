@@ -153,6 +153,27 @@ class MailTests(unittest.TestCase):
         # Pusta konfiguracja -> brak wysyłki, brak wyjątku.
         check.deliver_mails(action, action["checks"], NOW, env={})
 
+    def test_alert_bcc_copy(self):
+        import json
+
+        sent = []
+
+        def poster(data, api_key):
+            sent.append(json.loads(data))
+            return 200
+
+        _, action = check.decide({}, failing_site(), NOW, force_fail=True)
+        env = {"RESEND_API_KEY": "k", "ALERT_TO": "owner@example.com", "ALERT_BCC": "copy@example.com"}
+        check.deliver_mails(action, action["checks"], NOW, env=env, poster=poster)
+        self.assertEqual(sent[0]["to"], ["owner@example.com"])
+        self.assertEqual(sent[0]["bcc"], ["copy@example.com"])
+
+        sent.clear()
+        env["ALERT_TO_OVERRIDE"] = "test@example.com"
+        check.deliver_mails(action, action["checks"], NOW, env=env, poster=poster)
+        self.assertEqual(sent[0]["to"], ["test@example.com"])
+        self.assertNotIn("bcc", sent[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

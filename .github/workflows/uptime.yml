@@ -2,7 +2,7 @@ name: uptime
 
 # Monitor dostępności Radar Nieruchomości.
 # Repozytorium: goldedge-hub/radar-uptime
-# Sekrety: RESEND_API_KEY, ALERT_TO, ALERT_FROM (opcjonalnie ALERT_TO_OVERRIDE).
+# Sekrety: RESEND_API_KEY, ALERT_TO, ALERT_FROM (opcjonalnie ALERT_TO_OVERRIDE, ALERT_BCC = kopia alertów).
 
 on:
   schedule:
@@ -50,6 +50,7 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
           ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_BCC: ${{ secrets.ALERT_BCC }}
           ALERT_TO_OVERRIDE: ${{ github.event.inputs.alert_to_override || secrets.ALERT_TO_OVERRIDE }}
           FORCE_FAIL: ${{ github.event.inputs.force_fail || 'false' }}
         run: python3 check.py
