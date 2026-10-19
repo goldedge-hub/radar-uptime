@@ -53,10 +53,14 @@ SSL_HOST_DEFAULT = "radarnieruchomosci.com"
 SSL_PORT = 443
 SSL_MIN_DAYS = 14
 
-#: Każde sprawdzenie: 15 s timeout i jedna ponowna próba po 20 s.
+#: Każde sprawdzenie: 15 s timeout i dwie ponowne próby, po 10 s i po 30 s
+#: (backoff). Błąd DNS runnera GitHub ("Name or service not known", 19.10
+#: 13:55) albo restart kontenera mijają w kilka-kilkanaście sekund.
 HTTP_TIMEOUT = 15.0
-HTTP_RETRIES = 1
-HTTP_RETRY_DELAY = 20.0
+HTTP_RETRIES = 2
+HTTP_RETRY_DELAYS: tuple[float, ...] = (10.0, 30.0)
+#: Zgodność wsteczna: stała pauza, gdy ktoś poda ``retry_delay``.
+HTTP_RETRY_DELAY = HTTP_RETRY_DELAYS[0]
 USER_AGENT = "RadarUptime/1.0"
 
 #: Dwa kolejne nieudane przebiegi uruchamiają alarm; przypomnienie co 3 h.
@@ -146,7 +150,8 @@ def http_get(
     *,
     timeout: float = HTTP_TIMEOUT,
     retries: int = HTTP_RETRIES,
-    retry_delay: float = HTTP_RETRY_DELAY,
+    retry_delay: float | None = None,
+    retry_delays: tuple[float, ...] = HTTP_RETRY_DELAYS,
 ) -> tuple[int | None, str, str]:
     """GET z ponowieniem. Nieudane próby (transport lub nie-2xx) powtarzamy.
 
@@ -162,7 +167,11 @@ def http_get(
         if status is not None and 200 <= status < 300:
             return status, body, ""
         if attempt < attempts - 1:
-            time.sleep(retry_delay)
+            if retry_delay is not None:
+                time.sleep(retry_delay)
+            else:
+                delays = retry_delays or (0.0,)
+                time.sleep(delays[min(attempt, len(delays) - 1)])
     return status, body, error
 
 

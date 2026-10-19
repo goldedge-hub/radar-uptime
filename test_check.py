@@ -175,5 +175,18 @@ class MailTests(unittest.TestCase):
         self.assertNotIn("bcc", sent[0])
 
 
+
+class HttpBackoffTest(unittest.TestCase):
+    def test_dns_error_then_502_then_ok_with_backoff(self):
+        from unittest import mock
+
+        answers = iter([(None, "", "URLError: Name or service not known"), (502, "", ""), (200, "Radar", "")])
+        with mock.patch.object(check, "_http_get_once", lambda url, timeout: next(answers)), \
+                mock.patch.object(check.time, "sleep") as sleep:
+            status, _body, error = check.http_get("https://example.invalid/")
+        self.assertEqual((status, error), (200, ""))
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [10.0, 30.0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -31,7 +31,8 @@ concurrency:
 jobs:
   uptime:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 4 sprawdzenia x (3 próby po 15 s + 40 s pauz) w najgorszym razie = ~6 min.
+    timeout-minutes: 8
 
     steps:
       - name: Checkout
