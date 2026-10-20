@@ -14,14 +14,20 @@ zależności do instalowania.
 | `listing_detail` | id najnowszej oferty z `GET /api/listings?page_size=1&sort=created_at&order=desc`, potem `GET /oferta/<id>` → HTTP 200 |
 | `ssl_cert` | certyfikat na `radarnieruchomosci.com:443` ważny jeszcze co najmniej 14 dni |
 
-Każde sprawdzenie ma 15 s timeout i jedną ponowną próbę po 20 s. Adres
+Każde zapytanie ma 15 s timeout i jedną ponowną próbę po 5 s; błąd DNS runnera
+(„Name or service not known”, „Temporary failure in name resolution”) jest
+dodatkowo ponawiany z nowym rozwiązaniem nazwy po 2, 5 i 10 s. Nieudane
+sprawdzenie jest potwierdzane w tym samym przebiegu: powtarzane po 30, 60 i 90 s
+i uznane za awarię dopiero, gdy nie przejdzie w 3 kolejnych rundach trwających
+łącznie ≥ 3 min (restart przy deployu nie alarmuje). Adres
 publiczny `https://radarnieruchomosci.com/api/...` trafia do API dzięki
 przepisaniu `/api/:path*` w `apps/web/next.config.ts`.
 
 ## Alerty
 
-* Po **2 kolejnych nieudanych przebiegach** wysyłany jest e-mail
-  `[Radar] AWARIA strony: <sprawdzenia>`; przy `force_fail` alarm leci od razu.
+* Po awarii **potwierdzonej przez ~3 min** (≥ 3 nieudane rundy w jednym
+  przebiegu) wysyłany jest e-mail `[Radar] AWARIA strony: <sprawdzenia>`;
+  przy `force_fail` alarm leci od razu (bez potwierdzania).
 * Dopóki awaria trwa, przypomnienie wysyłane jest najwyżej **co 3 h**.
 * Po powrocie do działania przychodzi jednorazowy e-mail
   `[Radar] OK — strona działa` z czasem niedostępności.

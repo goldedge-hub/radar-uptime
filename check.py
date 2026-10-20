@@ -53,14 +53,28 @@ SSL_HOST_DEFAULT = "radarnieruchomosci.com"
 SSL_PORT = 443
 SSL_MIN_DAYS = 14
 
-#: Każde sprawdzenie: 15 s timeout i jedna ponowna próba po 20 s.
+#: Każde zapytanie: 15 s timeout i jedna szybka ponowna próba po 5 s.
 HTTP_TIMEOUT = 15.0
 HTTP_RETRIES = 1
-HTTP_RETRY_DELAY = 20.0
+HTTP_RETRY_DELAY = 5.0
+#: Błąd DNS runnera ("Name or service not known", "Temporary failure in name
+#: resolution") ponawiamy osobno, z nowym rozwiązaniem nazwy po 2 s, 5 s i 10 s.
+DNS_RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0, 10.0)
 USER_AGENT = "RadarUptime/1.0"
 
-#: Dwa kolejne nieudane przebiegi uruchamiają alarm; przypomnienie co 3 h.
-FAIL_THRESHOLD = 2
+#: Potwierdzenie awarii w ramach jednego przebiegu: nieudane sprawdzenie jest
+#: powtarzane (pauzy 30 s, 60 s, 90 s) i liczy się jako awaria dopiero, gdy
+#: nie przeszło w CONFIRM_MIN_FAILURES kolejnych rundach trwających łącznie
+#: >= CONFIRM_SECONDS (~3 min). Restart kontenera przy deployu albo chwilowy
+#: problem sieci runnera mija wcześniej i nie wywołuje alarmu.
+CONFIRM_SECONDS = 180.0
+CONFIRM_MIN_FAILURES = 3
+CONFIRM_DELAYS: tuple[float, ...] = (30.0, 60.0, 90.0)
+
+#: Awaria potwierdzona przez ~3 min w jednym przebiegu uruchamia alarm od razu
+#: (GitHub i tak pomija większość cronów, przebiegi bywają co kilka godzin);
+#: przypomnienie co 3 h.
+FAIL_THRESHOLD = 1
 REMINDER_SECONDS = 3 * 3600
 #: Ostrzeżenie o wygasającym certyfikacie najwyżej raz na dobę.
 SSL_WARN_SECONDS = 24 * 3600
@@ -158,11 +172,53 @@ def http_get(
     body = ""
     error = ""
     for attempt in range(attempts):
-        status, body, error = _http_get_once(url, timeout)
+        status, body, error = _get_resolving(url, timeout)
         if status is not None and 200 <= status < 300:
             return status, body, ""
         if attempt < attempts - 1:
             time.sleep(retry_delay)
+    return status, body, error
+
+
+_DNS_ERROR_MARKERS = (
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname",
+    "no address associated with hostname",
+    "gaierror",
+)
+
+
+def is_dns_error(error: str) -> bool:
+    """Czy błąd transportu to nieudane rozwiązanie nazwy (DNS)?"""
+    text = (error or "").lower()
+    return any(marker in text for marker in _DNS_ERROR_MARKERS)
+
+
+def _get_resolving(
+    url: str,
+    timeout: float,
+    *,
+    once=None,
+    sleep=None,
+    dns_delays: tuple[float, ...] | None = None,
+) -> tuple[int | None, str, str]:
+    """Jedna próba GET; przy błędzie DNS ponawia rozwiązanie nazwy.
+
+    19.10 runner GitHub zwrócił "Name or service not known" dla działającej
+    strony. Każde ponowienie robi nowy ``getaddrinfo`` (urllib nie cache'uje
+    DNS), więc chwilowa czkawka resolvera runnera nie jest liczona jako awaria.
+    """
+    once = once or _http_get_once
+    sleep = sleep or time.sleep
+    delays = DNS_RETRY_DELAYS if dns_delays is None else dns_delays
+    status, body, error = once(url, timeout)
+    for delay in delays:
+        if status is not None or not is_dns_error(error):
+            break
+        log.info("Błąd DNS (%s) — ponawiam rozwiązanie nazwy za %.0f s.", error, delay)
+        sleep(delay)
+        status, body, error = once(url, timeout)
     return status, body, error
 
 
@@ -342,8 +398,13 @@ def run_checks(
     get=http_get,
     connector=None,
     now: datetime | None = None,
+    only: set[str] | None = None,
 ) -> list[CheckResult]:
-    """Uruchom wszystkie sprawdzenia; pojedynczy błąd nie przerywa resztę."""
+    """Uruchom wszystkie sprawdzenia; pojedynczy błąd nie przerywa resztę.
+
+    ``only`` ogranicza przebieg do podanych nazw (ponowienia w
+    :func:`run_checks_confirmed`).
+    """
     jobs = (
         ("site_home", lambda: check_home(get, base_url, force_fail=force_fail)),
         ("api_ready", lambda: check_ready(get, base_url)),
@@ -352,6 +413,8 @@ def run_checks(
     )
     results: list[CheckResult] = []
     for name, job in jobs:
+        if only is not None and name not in only:
+            continue
         try:
             results.append(job())
         except Exception as exc:  # noqa: BLE001 - monitor nie może się wywrócić
@@ -359,6 +422,75 @@ def run_checks(
                 CheckResult(name, False, None, 0, f"nieoczekiwany błąd: {type(exc).__name__}: {exc}")
             )
     return results
+
+
+def run_checks_confirmed(
+    *,
+    base_url: str = SITE_URL_DEFAULT,
+    ssl_host: str = SSL_HOST_DEFAULT,
+    ssl_port: int = SSL_PORT,
+    force_fail: bool = False,
+    get=http_get,
+    connector=None,
+    now: datetime | None = None,
+    sleep=None,
+    clock=None,
+    confirm_seconds: float = CONFIRM_SECONDS,
+    min_failures: int = CONFIRM_MIN_FAILURES,
+    delays: tuple[float, ...] = CONFIRM_DELAYS,
+) -> list[CheckResult]:
+    """Jak :func:`run_checks`, ale awaria strony musi utrzymać się ~3 min.
+
+    Nieudane sprawdzenia HTTP są powtarzane (tylko one) po pauzach z
+    ``delays``. Sprawdzenie, które w którejś rundzie przejdzie, jest OK.
+    Pozostaje FAIL dopiero po ``min_failures`` kolejnych nieudanych rundach
+    trwających łącznie co najmniej ``confirm_seconds``. Certyfikat SSL nie jest
+    ponawiany (to nie awaria dostępności). ``force_fail`` pomija potwierdzanie,
+    żeby test ścieżki alertu trwał sekundy.
+    """
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    kwargs = dict(
+        base_url=base_url, ssl_host=ssl_host, ssl_port=ssl_port,
+        force_fail=force_fail, get=get, connector=connector, now=now,
+    )
+    results = run_checks(**kwargs)
+    if force_fail:
+        return results
+    by_name = {r.name: r for r in results}
+    failing = {r.name for r in results if not r.ok and r.name != SSL_CHECK_NAME}
+    if not failing:
+        return results
+    started = clock()
+    rounds = 1
+    while failing:
+        elapsed = clock() - started
+        if rounds >= max(int(min_failures), 1) and elapsed >= confirm_seconds:
+            break
+        delay = delays[min(rounds - 1, len(delays) - 1)] if delays else 30.0
+        log.info(
+            "Niepowodzenie %s (runda %d, %.0f s) — ponawiam za %.0f s.",
+            ",".join(sorted(failing)), rounds, elapsed, delay,
+        )
+        sleep(delay)
+        rounds += 1
+        for retried in run_checks(only=set(failing), **kwargs):
+            by_name[retried.name] = retried
+            if retried.ok:
+                log.info("%s przeszło w rundzie %d — bez alarmu.", retried.name, rounds)
+                failing.discard(retried.name)
+    elapsed = clock() - started
+    out: list[CheckResult] = []
+    for name in [r.name for r in results]:
+        r = by_name[name]
+        if name in failing:
+            r = CheckResult(
+                r.name, False, r.status, r.latency_ms,
+                f"{r.error} (potwierdzone: {rounds} prób w ~{int(elapsed)} s)",
+                r.ssl_days,
+            )
+        out.append(r)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +947,9 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(timezone.utc)
 
     log.info("Start monitora: %s (force_fail=%s).", base_url, force_fail)
-    results = run_checks(base_url=base_url, ssl_host=ssl_host, force_fail=force_fail, now=now)
+    results = run_checks_confirmed(
+        base_url=base_url, ssl_host=ssl_host, force_fail=force_fail, now=now
+    )
     for result in results:
         log.info("%s", format_result_line(result))
 

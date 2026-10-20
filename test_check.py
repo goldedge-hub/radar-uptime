@@ -37,8 +37,15 @@ def ssl(*, ok: bool, days: int) -> check.CheckResult:
 
 
 class DecideTests(unittest.TestCase):
+    def test_default_threshold_alerts_on_first_confirmed_failure(self):
+        # Failures are already confirmed for ~3 min inside the run
+        # (run_checks_confirmed), so the first failed run alerts.
+        _, action = check.decide({}, failing_site(), NOW)
+        self.assertEqual(action["kind"], "down")
+        self.assertTrue(action["notify"])
+
     def test_first_failure_no_alert(self):
-        new_state, action = check.decide({}, failing_site(), NOW)
+        new_state, action = check.decide({}, failing_site(), NOW, fail_threshold=2)
         self.assertEqual(action["kind"], "none")
         self.assertFalse(action["notify"])
         self.assertEqual(new_state["consecutive_failures"], 1)
@@ -47,7 +54,7 @@ class DecideTests(unittest.TestCase):
 
     def test_second_consecutive_failure_alerts(self):
         state = {"status": "up", "consecutive_failures": 1}
-        new_state, action = check.decide(state, failing_site(), NOW)
+        new_state, action = check.decide(state, failing_site(), NOW, fail_threshold=2)
         self.assertEqual(action["kind"], "down")
         self.assertTrue(action["notify"])
         self.assertEqual(new_state["status"], "down")
@@ -173,6 +180,132 @@ class MailTests(unittest.TestCase):
         check.deliver_mails(action, action["checks"], NOW, env=env, poster=poster)
         self.assertEqual(sent[0]["to"], ["test@example.com"])
         self.assertNotIn("bcc", sent[0])
+
+
+class DnsRetryTests(unittest.TestCase):
+    def test_dns_error_is_retried_with_fresh_resolution(self):
+        calls = []
+        answers = [
+            (None, "", "URLError: <urlopen error [Errno -2] Name or service not known>"),
+            (200, "Radar", ""),
+        ]
+
+        def once(url, timeout):
+            calls.append(url)
+            return answers.pop(0)
+
+        slept = []
+        status, body, error = check._get_resolving(
+            "https://radarnieruchomosci.com/", 1.0, once=once, sleep=slept.append
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(slept, [check.DNS_RETRY_DELAYS[0]])
+
+    def test_non_dns_error_is_not_retried_here(self):
+        calls = []
+
+        def once(url, timeout):
+            calls.append(url)
+            return None, "", "TimeoutError: timed out"
+
+        status, _, error = check._get_resolving("https://x/", 1.0, once=once, sleep=lambda s: None)
+        self.assertIsNone(status)
+        self.assertEqual(len(calls), 1)
+
+    def test_is_dns_error(self):
+        self.assertTrue(check.is_dns_error("URLError: <urlopen error [Errno -3] Temporary failure in name resolution>"))
+        self.assertFalse(check.is_dns_error("HTTP 502"))
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+
+def _getter(script):
+    """``script(round_no, url) -> (status, body, error)``; counts rounds by home hits."""
+    state = {"round": 0}
+
+    def get(url):
+        if url.endswith("/"):
+            state["round"] += 1
+        return script(state["round"], url)
+
+    return get
+
+
+def _ok_answer(url):
+    if "/api/health/ready" in url:
+        return 200, '{"status": "ready"}', ""
+    if "/api/listings" in url:
+        return 200, '{"items": [{"id": 7}]}', ""
+    return 200, "<html>Radar</html>", ""
+
+
+def _ssl_ok(host, port, timeout=None):
+    raise AssertionError("not used")
+
+
+class ConfirmTests(unittest.TestCase):
+    def _run(self, script):
+        clock = FakeClock()
+        results = check.run_checks_confirmed(
+            base_url="https://example.test",
+            get=_getter(script),
+            sleep=clock.sleep,
+            clock=clock,
+            connector=lambda *a, **k: None,
+            now=NOW,
+        )
+        return {r.name: r for r in results if r.name != check.SSL_CHECK_NAME}, clock
+
+    def test_short_outage_recovers_without_alert(self):
+        # 502 during a ~1 min deploy restart, OK on the 3rd round.
+        def script(round_no, url):
+            return (502, "Bad Gateway", "") if round_no <= 2 else _ok_answer(url)
+
+        results, clock = self._run(script)
+        self.assertTrue(all(r.ok for r in results.values()))
+        self.assertLess(clock.t, check.CONFIRM_SECONDS)
+        _, action = check.decide({}, list(results.values()), NOW)
+        self.assertFalse(action["notify"])
+
+    def test_persistent_outage_confirmed_after_three_minutes(self):
+        def script(round_no, url):
+            return 502, "Bad Gateway", ""
+
+        results, clock = self._run(script)
+        self.assertFalse(results["site_home"].ok)
+        self.assertGreaterEqual(clock.t, check.CONFIRM_SECONDS)
+        self.assertIn("potwierdzone", results["site_home"].error)
+        _, action = check.decide({}, list(results.values()), NOW)
+        self.assertEqual(action["kind"], "down")
+
+    def test_healthy_run_does_not_sleep(self):
+        results, clock = self._run(lambda round_no, url: _ok_answer(url))
+        self.assertTrue(all(r.ok for r in results.values()))
+        self.assertEqual(clock.t, 0.0)
+
+    def test_force_fail_skips_confirmation(self):
+        clock = FakeClock()
+        results = check.run_checks_confirmed(
+            base_url="https://example.test",
+            force_fail=True,
+            get=lambda url: (None, "", "URLError: Name or service not known") if "invalid" in url else _ok_answer(url),
+            sleep=clock.sleep,
+            clock=clock,
+            connector=lambda *a, **k: None,
+            now=NOW,
+        )
+        self.assertFalse(next(r for r in results if r.name == "site_home").ok)
+        self.assertEqual(clock.t, 0.0)
 
 
 if __name__ == "__main__":
